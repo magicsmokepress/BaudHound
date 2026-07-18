@@ -1,5 +1,7 @@
 # 🐾 BaudHound — Wireless Com Terminal
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A pocket-sized **wireless serial console** for the ESP32-S3. Tap any device's UART and read/write it over **WiFi (web + telnet)** *or* over **USB**, all at once — with **automatic baud-rate detection**, so you don't have to know the port speed in advance.
 
 Built for bench work: probe a device's TTL serial port, and BaudHound hunts for the baud, streams the output to your phone/laptop, and lets you type back.
