@@ -42,15 +42,13 @@ Built for bench work: probe a device's TTL serial port, and BaudHound hunts for 
 
 ### Wiring to the target device
 ```
-                          BaudHound (ESP32-S3)
-        WiFi  ~ ~ ~ ~ ~ ┌─────────────────────┐
-   phone / laptop        │                     │
-   web UI + telnet ──────┤ (radio)             │
-                         │                     │
-   PC ── USB ────────────┤ USB-CDC   GPIO16 RX ├──◄── target TX   (read target output)
-        (COM port)       │           GPIO17 TX ├──►── target RX   (write to target; omit for read-only)
-                         │           GND       ├──◄►─ target GND  (REQUIRED — common ground)
-                         └─────────────────────┘
+   BaudHound (ESP32-S3)                          Target device
+   ────────────────────                          ─────────────
+   GPIO16 (RX)  ◄─────────────────── TX   (read the target's output)
+   GPIO17 (TX)  ───────────────────► RX   (send to the target; omit for read-only)
+   GND          ◄──────────────────► GND  (REQUIRED — common ground)
+
+   Reach the console over  WiFi (web UI + telnet :23)  or  USB (COM port).
 ```
 - **3.3 V logic** on GPIO16/17. For a 5 V target, level-shift / divide its **TX** line down to 3.3 V.
 - **Read-only / "data-diode":** wire only target-TX → GPIO16 and GND; leave GPIO17 disconnected.
