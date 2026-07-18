@@ -2,6 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+**Topics:** `esp32` · `esp32-s3` · `arduino` · `serial-console` · `uart` · `baud-rate-detection` · `telnet` · `wifi` · `embedded`
+
 A pocket-sized **wireless serial console** for the ESP32-S3. Tap any device's UART and read/write it over **WiFi (web + telnet)** *or* over **USB**, all at once — with **automatic baud-rate detection**, so you don't have to know the port speed in advance.
 
 Built for bench work: probe a device's TTL serial port, and BaudHound hunts for the baud, streams the output to your phone/laptop, and lets you type back.
@@ -40,12 +42,18 @@ Built for bench work: probe a device's TTL serial port, and BaudHound hunts for 
 
 ### Wiring to the target device
 ```
-BaudHound GPIO16 (RX)  <---- target TX      (read the target's output)
-BaudHound GPIO17 (TX)  ----> target RX      (send to the target; omit for read-only)
-BaudHound GND          <---> target GND     (required)
+                          BaudHound (ESP32-S3)
+        WiFi  ~ ~ ~ ~ ~ ┌─────────────────────┐
+   phone / laptop        │                     │
+   web UI + telnet ──────┤ (radio)             │
+                         │                     │
+   PC ── USB ────────────┤ USB-CDC   GPIO16 RX ├──◄── target TX   (read target output)
+        (COM port)       │           GPIO17 TX ├──►── target RX   (write to target; omit for read-only)
+                         │           GND       ├──◄►─ target GND  (REQUIRED — common ground)
+                         └─────────────────────┘
 ```
-- **3.3 V logic.** For a 5 V target, add a level shifter / divider on its TX line.
-- **Read-only / "data-diode":** just wire target-TX → GPIO16 and GND. Leave GPIO17 disconnected.
+- **3.3 V logic** on GPIO16/17. For a 5 V target, level-shift / divide its **TX** line down to 3.3 V.
+- **Read-only / "data-diode":** wire only target-TX → GPIO16 and GND; leave GPIO17 disconnected.
 
 > ⚠️ Common ground is mandatory. If the two boards are powered from different supplies, the GND wire is what makes the link work.
 
