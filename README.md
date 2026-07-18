@@ -89,6 +89,10 @@ Built for bench work: probe a device's TTL serial port, and BaudHound hunts for 
 2. Join it from your phone/laptop. A **captive page** should pop up; if not, browse to **`http://192.168.4.1/`**.
 3. That's the console. To put it on your own network instead, tap **⚙ Settings → WiFi → Scan → pick your SSID → Save & Join**. The AP stays up as a fallback, and you can then also reach it at **`http://baudhound.local/`**.
 
+The **⚙ Settings** page — WiFi join plus the serial/COM parameters (port, RX/TX pins, baud, framing, wake-probe):
+
+<p align="center"><img src="docs/settings.png" alt="BaudHound settings page: WiFi join and serial/COM configuration" width="360"></p>
+
 ---
 
 ## Using it
