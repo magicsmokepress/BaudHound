@@ -30,7 +30,7 @@
 #include "driver/gpio.h"
 
 // ---------------- fixed defaults ----------------
-#define FW_VERSION "1.0"
+#define FW_VERSION "1.1"
 const char* HOSTNAME = "baudhound";         // AP ships open (no password) by design
 #define RGB_LED_PIN 48                      // onboard WS2812 (WiFi / activity status)
 // External common-cathode RGB LED: common leg -> a real GND pin (NOT a GPIO).
@@ -61,7 +61,9 @@ DNSServer        dns;
 HardwareSerial*  com = &Serial1;
 WiFiClient tclients[4];
 String     tbuf[4];
-uint8_t    tskip[4] = {0};
+// telnet input IAC parser state, per client (handles IAC IAC literal, WILL/WONT/DO/DONT, and SB..SE subneg)
+enum { T_NORMAL=0, T_IAC, T_OPT, T_SB, T_SB_IAC };
+uint8_t    tstate[4] = {0};
 
 volatile bool scanning = false, applyWifi = false, applySerial = false;
 uint32_t lastRxMs = 0, lastTxMs = 0;
@@ -125,10 +127,15 @@ void openLink(){
   com->begin(cfg.baud?cfg.baud:115200, serialConfig(cfg.dbits,cfg.parity,cfg.sbits), cfg.rx, cfg.tx);
   if(cfg.rx>=0) gpio_pullup_en((gpio_num_t)cfg.rx);  // idle RX high WITHOUT detaching UART (core 3.x periman)
 }
-void broadcast(const String& line){
-  lastRxMs=millis();
+void telnetSend(WiFiClient& c, const String& s){     // escape 0xFF (IAC) so a target's binary bytes aren't read as telnet commands
+  for(size_t i=0;i<s.length();i++){ uint8_t b=(uint8_t)s[i];
+    c.write(b); if(b==0xFF) c.write((uint8_t)0xFF); }
+}
+void broadcast(const String& line){                  // status + target lines to all viewers
+  // NB: do NOT stamp lastRxMs here — that would light the RX/activity LED on our own
+  // bracketed status output. Real wire RX is stamped only in loop()'s read path.
   sse.send(line.c_str(),"message");
-  for(auto& c:tclients) if(c&&c.connected()){ c.print(line); c.print("\r\n"); }
+  for(auto& c:tclients) if(c&&c.connected()){ telnetSend(c,line); c.print("\r\n"); }
 }
 void toTarget(const String& s){ lastTxMs=millis(); com->print(s); com->print("\r\n"); }
 
@@ -148,6 +155,8 @@ uint32_t detectBaud(bool active=false){
         if(com->available()){ uint8_t b=com->read(); total[i]++; saw=true;
           if(b==9||b==10||b==13||(b>=32&&b<=126)) good[i]++; }
         updateLed();
+        yield();   // feed IDLE/task-WDT; detection blocks loop() by design.
+        // ponytail: blocking ~pass*bauds*WIN. Upgrade path = cooperative state machine across loop() iters if transports must stay live mid-scan.
       }
       if(total[i]>=MINB && (float)good[i]/total[i]>=0.92f){     // clear winner -> stop now
         scanning=false; comSawData=true;
@@ -332,11 +341,15 @@ function load(){fetch('/status').then(r=>r.json()).then(s=>{
  g('ssid').value=s.ssid;g('uart').value=s.uart;g('rx').value=s.rx;g('tx').value=s.tx;
  g('baud').value=s.baud;g('dbits').value=s.dbits;g('parity').value=s.parity;g('sbits').value=s.sbits;
  g('probe').value=s.probe;})}
-function scan(){g('nets').innerHTML='<small>scanning&hellip;</small>';
- fetch('/scan').then(r=>r.json()).then(l=>{g('nets').innerHTML='';
+function scan(){g('nets').innerHTML='<small>scanning&hellip;</small>';pollScan()}
+function pollScan(){fetch('/scan').then(r=>r.json()).then(s=>{
+  if(s.scanning){setTimeout(pollScan,1200);return}          // async scan still running -> poll again
+  var l=s.nets||[];g('nets').innerHTML='';
   l.sort((a,b)=>b.rssi-a.rssi).forEach(n=>{let d=document.createElement('div');
    d.textContent=(n.enc?'\uD83D\uDD12 ':'\uD83D\uDD13 ')+n.ssid+'  ('+n.rssi+')';
-   d.onclick=()=>{g('ssid').value=n.ssid;g('pass').focus()};g('nets').appendChild(d)})})}
+   d.onclick=()=>{g('ssid').value=n.ssid;g('pass').focus()};g('nets').appendChild(d)})
+  if(!l.length)g('nets').innerHTML='<small>no networks found</small>'
+ }).catch(e=>{g('nets').innerHTML='<small>scan failed</small>'})}
 function joinWifi(){fetch('/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
  body:'ssid='+encodeURIComponent(g('ssid').value)+'&pass='+encodeURIComponent(g('pass').value)})
  .then(()=>{alert('Joining '+g('ssid').value+'\u2026 (AP stays up)');setTimeout(load,4000)})}
@@ -361,12 +374,20 @@ void handleStatus(AsyncWebServerRequest* r){
   j+=",\"probe\":"+String(cfg.probe?1:0)+"}";
   r->send(200,"application/json",j);
 }
+// Non-blocking: never call the synchronous WiFi.scanNetworks() here — this runs on the
+// AsyncTCP task and would stall all HTTP for seconds (and trip the async_tcp WDT). Instead
+// kick an async scan and let the client poll; scanComplete()/SSID()/etc. are cheap reads.
 void handleScan(AsyncWebServerRequest* r){
-  int n=WiFi.scanNetworks(); String j="[";
+  int n=WiFi.scanComplete();
+  if(n==WIFI_SCAN_RUNNING){ r->send(200,"application/json","{\"scanning\":true}"); return; }
+  if(n==WIFI_SCAN_FAILED){ WiFi.scanNetworks(true);   // async=true -> returns immediately
+    r->send(200,"application/json","{\"scanning\":true}"); return; }
+  String j="{\"nets\":[";
   for(int i=0;i<n;i++){ if(i)j+=",";
     j+="{\"ssid\":\""+jsonEsc(WiFi.SSID(i))+"\",\"rssi\":"+String(WiFi.RSSI(i))
       +",\"enc\":"+(WiFi.encryptionType(i)==WIFI_AUTH_OPEN?"false":"true")+"}"; }
-  j+="]"; WiFi.scanDelete(); r->send(200,"application/json",j);
+  j+="]}"; WiFi.scanDelete();                          // free; next /scan (no scan running) starts a fresh one
+  r->send(200,"application/json",j);
 }
 
 void setup(){
@@ -449,17 +470,29 @@ void loop(){
   if(telnet.hasClient()){
     bool placed=false;
     for(int i=0;i<4;i++) if(!tclients[i]||!tclients[i].connected()){
-      tclients[i]=telnet.available(); tbuf[i]=""; tskip[i]=0;
+      tclients[i]=telnet.available(); tbuf[i]=""; tstate[i]=T_NORMAL;
       tclients[i].println("[connected]"); placed=true; break; }
     if(!placed) telnet.available().stop();
   }
   for(int i=0;i<4;i++){ WiFiClient& c=tclients[i];
     if(!c||!c.connected()) continue;
     while(c.available()){ uint8_t b=c.read();
-      if(tskip[i]){ tskip[i]--; continue; }
-      if(b==0xFF){ tskip[i]=2; continue; }
-      if(b=='\n'){ handleInput(tbuf[i]); tbuf[i]=""; }
-      else if(b!='\r'&&tbuf[i].length()<512) tbuf[i]+=(char)b; }
+      switch(tstate[i]){
+        case T_IAC:                                        // prev byte was IAC (0xFF)
+          if(b==0xFF){ if(tbuf[i].length()<512) tbuf[i]+=(char)0xFF; tstate[i]=T_NORMAL; } // IAC IAC = literal 0xFF
+          else if(b==250)            tstate[i]=T_SB;       // SB  -> subnegotiation
+          else if(b>=251 && b<=254)  tstate[i]=T_OPT;      // WILL/WONT/DO/DONT -> one option byte follows
+          else                       tstate[i]=T_NORMAL;   // other 2-byte command
+          break;
+        case T_OPT:  tstate[i]=T_NORMAL; break;            // swallow the option byte
+        case T_SB:   if(b==0xFF) tstate[i]=T_SB_IAC; break;// skip subneg payload until IAC SE
+        case T_SB_IAC: tstate[i]=(b==240)?T_NORMAL:T_SB; break; // IAC SE ends it; IAC IAC stays in SB
+        default:                                           // T_NORMAL
+          if(b==0xFF)                       tstate[i]=T_IAC;
+          else if(b=='\n'){ handleInput(tbuf[i]); tbuf[i]=""; }
+          else if(b!='\r' && tbuf[i].length()<512) tbuf[i]+=(char)b;
+      }
+    }
   }
   // USB terminal (native USB CDC) <-> target : raw transparent passthrough
   if(Serial){ while(Serial.available()){ com->write((uint8_t)Serial.read()); lastTxMs=millis(); } }

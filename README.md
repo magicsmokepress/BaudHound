@@ -117,6 +117,7 @@ Open `http://192.168.4.1/` (on the AP) or `http://baudhound.local/` (on your LAN
 - To see what you type, enable **Terminal → Local echo: Force on**.
 - For clean line endings, **Terminal → Implicit CR in every LF** can help with some targets.
 - Up to **4 telnet clients** can watch at once.
+- Telnet and the web console are **line-oriented text** views (a `0xFF` byte is escaped, but a stream with no newlines just buffers). For **raw or binary** target data, use the **USB** path — it's byte-for-byte.
 
 Command-line equivalents:
 ```bash
