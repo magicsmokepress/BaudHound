@@ -85,7 +85,7 @@ Built for bench work: probe a device's TTL serial port, and BaudHound hunts for 
 
 1. On boot the device starts an **open WiFi AP** named **`BaudHound-XXXX`** (XXXX = last MAC bytes).
 2. Join it from your phone/laptop. A **captive page** should pop up; if not, browse to **`http://192.168.4.1/`**.
-3. That's the console. To put it on your own network instead, tap **⚙ Settings → WiFi → Scan → pick your SSID → Save & Join**. The AP stays up as a fallback, and you can then also reach it at **`http://baudhound.local/`**.
+3. That's the console. To put it on your own network instead, tap **⚙ Settings → WiFi → Scan → pick your SSID → Save & Join**. The AP stays up as a fallback, and once joined you can also reach it at the **LAN IP shown in ⚙ Settings**.
 
 The **⚙ Settings** page — WiFi join plus the serial/COM parameters (port, RX/TX pins, baud, framing, wake-probe):
 
@@ -99,7 +99,7 @@ The **⚙ Settings** page — WiFi join plus the serial/COM parameters (port, RX
 
 <p align="center"><img src="docs/console.png" alt="BaudHound web console showing auto-baud lock and live target output" width="360"></p>
 
-Open `http://192.168.4.1/` (on the AP) or `http://baudhound.local/` (on your LAN).
+Open `http://192.168.4.1/` (on the AP), or the **LAN IP shown in ⚙ Settings** after you join WiFi.
 - Live output streams into the log.
 - Type in the box + **Enter** to send (↑/↓ recalls history; commands echo as `> ...`).
 - **Baud dropdown** in the top bar: pick **Auto** or a fixed speed.

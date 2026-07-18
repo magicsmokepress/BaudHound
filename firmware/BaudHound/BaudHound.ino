@@ -4,12 +4,12 @@
  * Open SoftAP "BaudHound-XXXX" (always up). Join it -> captive page. Settings
  * page joins your WiFi and configures the COM port. RGB LEDs show net + link status.
  *
- *   Console : http://baudhound.local/  or  http://192.168.4.1/ (on AP)
+ *   Console : http://192.168.4.1/ (on the AP); on your LAN use the IP shown in Settings
  *   Telnet  : telnet <ip> 23
  *
  * Board  : "ESP32S3 Dev Module"  (USB CDC On Boot: Enabled, for the debug Serial)
  * Wiring : chosen RX pin <- target TX, TX pin -> target RX, GND<->GND  (3.3V)
- * Libs   : ESPAsyncWebServer + AsyncTCP.  WiFi/ESPmDNS/DNSServer/Preferences built in.
+ * Libs   : ESPAsyncWebServer + AsyncTCP.  WiFi/DNSServer/Preferences built in.
  * LEDs   : built-in WS2812 (core >= 3.x provides rgbLedWrite()) + optional external RGB.
  *
  * Onboard WS2812 (network status):
@@ -23,15 +23,13 @@
  */
 
 #include <WiFi.h>
-#include <ESPmDNS.h>
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ESPAsyncWebServer.h>
 #include "driver/gpio.h"
 
 // ---------------- fixed defaults ----------------
-#define FW_VERSION "1.2"
-const char* HOSTNAME = "baudhound";         // AP ships open (no password) by design
+#define FW_VERSION "1.3"
 #define RGB_LED_PIN 48                      // onboard WS2812 (WiFi / activity status)
 // External common-cathode RGB LED: common leg -> a real GND pin (NOT a GPIO).
 #define SWAP_LED   37                       // RGB red   = RX/TX swapped
@@ -407,11 +405,10 @@ void setup(){
   if(cfg.ssid[0]) startJoin();
 
   dns.start(53,"*",WiFi.softAPIP());
-  if(MDNS.begin(HOSTNAME)) MDNS.addService("http","tcp",80);
 
   Serial.printf("\n== BaudHound (Wireless Com Terminal) v%s ==\n",FW_VERSION);
   Serial.printf("AP: %s (open) @ %s\n",apName,WiFi.softAPIP().toString().c_str());
-  Serial.printf("Console: http://%s.local/   Telnet :23\n",HOSTNAME);
+  Serial.printf("Console: http://%s/   Telnet :23\n",WiFi.softAPIP().toString().c_str());
 
   if(cfg.baud==0){ Serial.println("Auto-detecting baud...");
     uint32_t d=autoBaud(cfg.probe);
