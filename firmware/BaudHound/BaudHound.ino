@@ -30,7 +30,7 @@
 #include "driver/gpio.h"
 
 // ---------------- fixed defaults ----------------
-#define FW_VERSION "1.1"
+#define FW_VERSION "1.2"
 const char* HOSTNAME = "baudhound";         // AP ships open (no password) by design
 #define RGB_LED_PIN 48                      // onboard WS2812 (WiFi / activity status)
 // External common-cathode RGB LED: common leg -> a real GND pin (NOT a GPIO).
@@ -505,6 +505,11 @@ void loop(){
     gTotal++; if(ch==9||ch==10||ch==13||((uint8_t)ch>=32&&(uint8_t)ch<=126)) gPrint++;
     if(ch=='\n'){ broadcast(lineBuf); lineBuf=""; }
     else if(ch!='\r'&&lineBuf.length()<512) lineBuf+=ch; }
+
+  // Idle flush: surface a prompt-without-newline (e.g. "login: ") on web+telnet once the
+  // stream pauses, instead of withholding it until the next '\n'. Text only; raw binary -> USB.
+  // 40ms idle >> inter-byte gap at 9600+ baud, so this only fires between bursts, not mid-line.
+  if(lineBuf.length() && millis()-lastRxMs > 40){ broadcast(lineBuf); lineBuf=""; }
 
   // Auto-repoll: in Auto mode, if the stream looks garbled (probe moved to a
   // port running a different baud), rescan and lock onto the new speed.
