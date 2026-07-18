@@ -94,6 +94,9 @@ Built for bench work: probe a device's TTL serial port, and BaudHound hunts for 
 ## Using it
 
 ### 1. Web console
+
+<p align="center"><img src="docs/console.png" alt="BaudHound web console showing auto-baud lock and live target output" width="360"></p>
+
 Open `http://192.168.4.1/` (on the AP) or `http://baudhound.local/` (on your LAN).
 - Live output streams into the log.
 - Type in the box + **Enter** to send (↑/↓ recalls history; commands echo as `> ...`).
