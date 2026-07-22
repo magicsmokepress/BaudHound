@@ -232,6 +232,23 @@ The AP ships **open** (no password) for convenience. Anyone in range can reach t
 
 ---
 
+## Prior Art
+
+WiFi/telnet-to-UART bridges are a well-established category; BaudHound builds on
+that lineage and adds a pocket ESP32-S3 form factor with automatic baud
+detection.
+
+- **[esp-link](https://github.com/jeelabs/esp-link)** (jeelabs) — the canonical ESP8266 WiFi-to-serial bridge with telnet, a web console, and flash programming. *Closest predecessor (single UART, no auto-baud).*
+- **[ESP32-Serial-Bridge](https://github.com/AlphaLima/ESP32-Serial-Bridge)** — transparent WiFi(TCP)-to-3×UART bridge. *Adjacent, raw transport only.*
+- **[esp32-remote-serial-console](https://github.com/electronicayciencia/esp32-remote-serial-console)** — ESP32-C3 out-of-band telnet console for headless access. *Similar use-case, telnet-only.*
+- **[uart-bridge](https://github.com/Tymbark7372/uart-bridge)** (Tymbark7372) — ESP32-C3 pocket console with web terminal + telnet + OTA. *Closest feature match; baud is manual.*
+- **[ESP32-UART-Bridge](https://github.com/zvldz/ESP32-UART-Bridge)** — high-throughput universal UART↔USB/WiFi bridge. *Adjacent, general-purpose.*
+- **[RetroWiFiModem](https://github.com/mecparts/RetroWiFiModem)** — ESP8266 RS-232↔WiFi Hayes modem for vintage gear. *Adjacent, different niche.*
+
+BaudHound's distinguishing combination is ESP32-S3 + pocket form factor + web UI
+**and** telnet **and** USB **plus automatic baud-rate detection** — the
+auto-baud in particular is absent from the closest matches above.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
