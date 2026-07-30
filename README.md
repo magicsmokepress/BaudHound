@@ -228,7 +228,7 @@ Modern browsers use DNS-over-HTTPS, which bypasses the device's captive DNS — 
 
 ## Security note
 
-The AP ships **open** (no password) for convenience. Anyone in range can reach the console — and therefore read/write whatever target UART is attached. Fine for a bench; add a password (`AP_PASS` + `WiFi.softAP(apName, AP_PASS)`) before leaving it connected to anything sensitive.
+The AP ships **open** (no password) for convenience. Anyone in range can reach the console — and therefore read/write whatever target UART is attached. Fine for a bench; add a password (`AP_PASS` + `WiFi.softAP(apName, AP_PASS)`) before leaving it connected to anything sensitive, or DO NOT USE IT. Intent for this is quick and dirty, temporary connectivity to an IOT TTL serial port. Do not use it for where integrity, security and confidentiality are required. 
 
 ---
 
