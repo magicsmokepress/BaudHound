@@ -26,6 +26,7 @@ Built for bench work: probe a device's TTL serial port, and BaudHound hunts for 
 - **Active "wake" probe** — optionally sends an Enter to nudge a silent console into responding, then detects.
 - **RX/TX auto-swap** — reversed the data wires? It flips orientation and recovers on its own.
 - **Captive-portal setup** — join the open AP, a page pops up; from there you can join your own WiFi.
+- **Discovery** - answers a UDP broadcast so [BaudHoundTerm](https://github.com/magicsmokepress/baudhoundterm) finds it on the network without you looking up its IP (firmware 1.4+, can be turned off).
 - **Status LEDs** — onboard RGB shows network state; optional external RGB shows link state.
 
 ---
@@ -117,6 +118,7 @@ Open `http://192.168.4.1/` (on the AP), or the **LAN IP shown in ⚙ Settings** 
 - To see what you type, enable **Terminal → Local echo: Force on**.
 - For clean line endings, **Terminal → Implicit CR in every LF** can help with some targets.
 - Up to **4 telnet clients** can watch at once.
+- Enter may arrive as CR, LF, CR LF or CR NUL; each ends the line once. Backspace edits the line before it is sent (firmware 1.4+; 1.3 acted only on LF, so a bare-CR client sent nothing).
 - Telnet and the web console are **line-oriented text** views: output flushes per line, or after a brief pause (so a prompt with no newline like `login:` still shows), and each line is capped at 512 chars. For **raw or binary** (8-bit, newline-less) target data, use the **USB** path — it's byte-for-byte.
 
 Command-line equivalents:
@@ -130,6 +132,29 @@ Plug BaudHound into your PC — it enumerates as a **COM port**.
 - **PuTTY:** Connection type **Serial**, **Serial line** = your COM port, **Speed** = anything (native USB-CDC ignores it), **Open**.
 - This path is **raw / per-character**, so interactive menus, arrow keys, and prompts-without-newlines all work.
 - The **actual target baud** is whatever BaudHound is set to (Auto or fixed) — set it in the web UI, not in PuTTY.
+
+### 4. BaudHoundTerm (Windows)
+[BaudHoundTerm](https://github.com/magicsmokepress/baudhoundterm) is the desktop console for BaudHound. Its **BaudHound** button lists the devices on the networks the PC is on and opens one in a telnet tab set up for it: local echo and line editing, these `~` commands on the right-click menu, logging, and reconnect. It can also save the device as a shortcut; saving it again after its DHCP address changes moves the shortcut to the new address.
+
+---
+
+## Discovery protocol
+
+Firmware 1.4 and later listen on **UDP 47023**. A datagram starting with `BAUDHOUND?` gets one JSON object back, sent to the asker:
+
+```json
+{"baudhound":1,"name":"BaudHound-41D0","fw":"1.4","ip":"192.168.1.50","apip":"192.168.4.1",
+ "sta":true,"ssid":"bench","lanip":"192.168.1.50","telnet":23,"http":80,
+ "baud":0,"rate":115200,"scanning":false}
+```
+
+`ip` is the address the query arrived on, `baud` is the configured speed (0 = auto) and `rate` the speed in use now. It answers on its own AP and on the joined network, also while a baud scan is running, and at most 8 replies a second. Try it from a Linux shell:
+
+```bash
+python3 -c "import socket as s;u=s.socket(2,2);u.setsockopt(1,6,1);u.settimeout(2);u.sendto(b'BAUDHOUND?',('255.255.255.255',47023));print(u.recvfrom(512))"
+```
+
+Turn it off under **⚙ Settings → Serial / COM → Answer discovery**. Firmware before 1.4 does not answer; BaudHoundTerm still finds one of those when the PC has joined its AP, by reading `http://192.168.4.1/status`.
 
 ---
 
@@ -145,7 +170,7 @@ Type these in the **web** or **telnet** console (not the USB passthrough — the
 | `~probe` | Toggle **active wake-probe** (sends Enter during detection) |
 | `~probe on` / `~probe off` | Force wake-probe on/off |
 | `~swap` | Swap RX/TX pin assignment (for a reversed cable) |
-| `~version` / `~info` | Show firmware version + current link settings |
+| `~version` / `~info` | Show firmware version, current link settings and whether discovery is on |
 | `~ledtest` | Cycle the status LEDs to verify wiring/colors |
 
 Anything **without** a leading `~` is sent to the target device as-is.
@@ -228,7 +253,7 @@ Modern browsers use DNS-over-HTTPS, which bypasses the device's captive DNS — 
 
 ## Security note
 
-The AP ships **open** (no password) for convenience. Anyone in range can reach the console — and therefore read/write whatever target UART is attached. Fine for a bench; add a password (`AP_PASS` + `WiFi.softAP(apName, AP_PASS)`) before leaving it connected to anything sensitive, or DO NOT USE IT. Intent for this is quick and dirty, temporary connectivity to an IOT TTL serial port. Do not use it for where integrity, security and confidentiality are required. 
+The AP ships **open** (no password) for convenience. Discovery (UDP 47023) tells anyone on the same network that a BaudHound is there and which network it joined; switch it off in Settings when that matters. Anyone in range can reach the console — and therefore read/write whatever target UART is attached. Fine for a bench; add a password (`AP_PASS` + `WiFi.softAP(apName, AP_PASS)`) before leaving it connected to anything sensitive, or DO NOT USE IT. Intent for this is quick and dirty, temporary connectivity to an IOT TTL serial port. Do not use it for where integrity, security and confidentiality are required. 
 
 ---
 

@@ -6,6 +6,7 @@
  *
  *   Console : http://192.168.4.1/ (on the AP); on your LAN use the IP shown in Settings
  *   Telnet  : telnet <ip> 23
+ *   Find it : UDP broadcast "BAUDHOUND?" to port 47023; each device answers with a JSON line
  *
  * Board  : "ESP32S3 Dev Module"  (USB CDC On Boot: Enabled, for the debug Serial)
  * Wiring : chosen RX pin <- target TX, TX pin -> target RX, GND<->GND  (3.3V)
@@ -26,15 +27,17 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ESPAsyncWebServer.h>
+#include <AsyncUDP.h>
 #include "driver/gpio.h"
 
 // ---------------- fixed defaults ----------------
-#define FW_VERSION "1.3"
+#define FW_VERSION "1.4"
 #define RGB_LED_PIN 48                      // onboard WS2812 (WiFi / activity status)
 // External common-cathode RGB LED: common leg -> a real GND pin (NOT a GPIO).
 #define SWAP_LED   37                       // RGB red   = RX/TX swapped
 #define PROBE_LED  39                       // RGB green  = probing / scanning
 #define LOCK_LED   40                       // RGB blue   = receiving / locked
+#define DISCOVERY_PORT 47023                // UDP: answers "BAUDHOUND?" so a desktop app can find it
 // ------------------------------------------------
 
 struct Cfg {
@@ -48,6 +51,7 @@ struct Cfg {
   char     parity= 'N';
   uint8_t  sbits = 1;
   bool     probe = false;    // send a wake char (Enter) during autodetect
+  bool     discover = true;  // answer discovery broadcasts (appended: older saved configs keep the default)
 } cfg;
 
 Preferences      prefs;
@@ -55,6 +59,7 @@ AsyncWebServer   http(80);
 AsyncEventSource sse("/stream");
 WiFiServer       telnet(23);
 DNSServer        dns;
+AsyncUDP         discovery;
 
 HardwareSerial*  com = &Serial1;
 WiFiClient tclients[4];
@@ -62,6 +67,7 @@ String     tbuf[4];
 // telnet input IAC parser state, per client (handles IAC IAC literal, WILL/WONT/DO/DONT, and SB..SE subneg)
 enum { T_NORMAL=0, T_IAC, T_OPT, T_SB, T_SB_IAC };
 uint8_t    tstate[4] = {0};
+bool       tcr[4] = {false};   // last data byte was CR: a following LF or NUL belongs to the same Enter
 
 volatile bool scanning = false, applyWifi = false, applySerial = false;
 uint32_t lastRxMs = 0, lastTxMs = 0;
@@ -223,7 +229,7 @@ void handleInput(String line){
   if(t=="~version"||t=="~info"){
     broadcast(String("[BaudHound v")+FW_VERSION+"  uart"+cfg.uart+" rx"+cfg.rx+" tx"+cfg.tx
       +" baud="+(cfg.baud?String(cfg.baud):String("auto"))+" probe="+(cfg.probe?"on":"off")
-      +" swapped="+(rxtxSwapped?"yes":"no")+"]"); return; }
+      +" swapped="+(rxtxSwapped?"yes":"no")+" discovery="+(cfg.discover?"on":"off")+"]"); return; }
   if(t=="~ledtest"){
     broadcast("[ledtest] external RGB 0.7s each: GPIO37(red), GPIO39(green), GPIO40(blue); then onboard R/G/B/W");
     int pins[]={SWAP_LED,PROBE_LED,LOCK_LED};
@@ -328,6 +334,8 @@ small{color:#888}</style>
  </div>
  <label>Wake probe (send Enter during autodetect to wake a silent console)</label>
  <select id=probe><option value=0>Off</option><option value=1>On</option></select>
+ <label>Answer discovery (lets BaudHoundTerm find this device on the network, UDP 47023)</label>
+ <select id=discover><option value=1>On</option><option value=0>Off</option></select>
  <button onclick=applySerial()>Apply &amp; Save</button>
  <button onclick=swapRxTx() style="background:#a63">Swap RX/TX</button>
 </div></div>
@@ -338,7 +346,7 @@ function load(){fetch('/status').then(r=>r.json()).then(s=>{
   +'<br><small>AP: '+s.ap+' @ '+s.apip+'</small>';
  g('ssid').value=s.ssid;g('uart').value=s.uart;g('rx').value=s.rx;g('tx').value=s.tx;
  g('baud').value=s.baud;g('dbits').value=s.dbits;g('parity').value=s.parity;g('sbits').value=s.sbits;
- g('probe').value=s.probe;})}
+ g('probe').value=s.probe;g('discover').value=s.discover;})}
 function scan(){g('nets').innerHTML='<small>scanning&hellip;</small>';pollScan()}
 function pollScan(){fetch('/scan').then(r=>r.json()).then(s=>{
   if(s.scanning){setTimeout(pollScan,1200);return}          // async scan still running -> poll again
@@ -351,7 +359,7 @@ function pollScan(){fetch('/scan').then(r=>r.json()).then(s=>{
 function joinWifi(){fetch('/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
  body:'ssid='+encodeURIComponent(g('ssid').value)+'&pass='+encodeURIComponent(g('pass').value)})
  .then(()=>{alert('Joining '+g('ssid').value+'\u2026 (AP stays up)');setTimeout(load,4000)})}
-function applySerial(){let p=['uart','rx','tx','baud','dbits','parity','sbits','probe']
+function applySerial(){let p=['uart','rx','tx','baud','dbits','parity','sbits','probe','discover']
  .map(k=>k+'='+encodeURIComponent(g(k).value)).join('&');
  fetch('/serial',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p})
  .then(()=>alert('Applied'+(g('baud').value=='0'?' (auto-detecting\u2026)':'')))}
@@ -369,7 +377,9 @@ void handleStatus(AsyncWebServerRequest* r){
   j+=",\"uart\":"+String(cfg.uart)+",\"rx\":"+String(cfg.rx)+",\"tx\":"+String(cfg.tx);
   j+=",\"baud\":"+String(cfg.baud)+",\"dbits\":"+String(cfg.dbits);
   j+=",\"parity\":\""+String(cfg.parity)+"\",\"sbits\":"+String(cfg.sbits);
-  j+=",\"probe\":"+String(cfg.probe?1:0)+"}";
+  j+=",\"probe\":"+String(cfg.probe?1:0);
+  j+=",\"discover\":"+String(cfg.discover?1:0);
+  j+=",\"fw\":\"" FW_VERSION "\",\"rate\":"+String(com->baudRate())+"}";
   r->send(200,"application/json",j);
 }
 // Non-blocking: never call the synchronous WiFi.scanNetworks() here — this runs on the
@@ -386,6 +396,29 @@ void handleScan(AsyncWebServerRequest* r){
       +",\"enc\":"+(WiFi.encryptionType(i)==WIFI_AUTH_OPEN?"false":"true")+"}"; }
   j+="]}"; WiFi.scanDelete();                          // free; next /scan (no scan running) starts a fresh one
   r->send(200,"application/json",j);
+}
+
+// Discovery: a client broadcasts "BAUDHOUND?" to UDP 47023 and every device on that segment
+// answers the sender with one JSON object. Runs on the AsyncUDP task, so it still answers while
+// loop() is blocked in a baud scan; it only reads state. Replies are capped per second because a
+// spoofed source address would otherwise turn the device into a small reflector.
+void onDiscovery(AsyncUDPPacket& p){
+  static const char Q[]="BAUDHOUND?";
+  if(!cfg.discover || p.length()<sizeof(Q)-1 || memcmp(p.data(),Q,sizeof(Q)-1)!=0) return;
+  static uint32_t win=0; static uint8_t sent=0; uint32_t now=millis();
+  if(now-win>1000){ win=now; sent=0; }
+  if(++sent>8) return;
+  bool sta=WiFi.status()==WL_CONNECTED; String j="{\"baudhound\":1";
+  j+=",\"name\":\""+String(apName)+"\",\"fw\":\"" FW_VERSION "\"";
+  j+=",\"ip\":\""+p.localIP().toString()+"\"";
+  j+=",\"apip\":\""+WiFi.softAPIP().toString()+"\"";
+  j+=",\"sta\":"+String(sta?"true":"false");
+  j+=",\"ssid\":\""+jsonEsc(sta?String(cfg.ssid):String(""))+"\"";
+  j+=",\"lanip\":\""+(sta?WiFi.localIP().toString():String(""))+"\"";
+  j+=",\"telnet\":23,\"http\":80";
+  j+=",\"baud\":"+String(cfg.baud)+",\"rate\":"+String(com->baudRate());
+  j+=",\"scanning\":"+String(scanning?"true":"false")+"}";
+  p.write((const uint8_t*)j.c_str(),j.length());
 }
 
 void setup(){
@@ -435,6 +468,7 @@ void setup(){
     cfg.sbits=P("sbits",cfg.sbits)==2?2:1;
     if(r->hasParam("parity",true)){ char c=r->getParam("parity",true)->value()[0]; cfg.parity=(c=='E'||c=='O')?c:'N'; }
     cfg.probe=P("probe",cfg.probe?1:0)!=0;
+    cfg.discover=P("discover",cfg.discover?1:0)!=0;
     cfgSave(); applySerial=true; r->send(200,"text/plain","ok"); });
   http.on("/swap",     HTTP_POST, [](AsyncWebServerRequest* r){
     swapRxTx(); cfgSave(); r->send(200,"text/plain","ok"); });
@@ -448,6 +482,7 @@ void setup(){
   http.begin();
 
   telnet.begin(); telnet.setNoDelay(true);
+  if(discovery.listen(DISCOVERY_PORT)) discovery.onPacket(onDiscovery);   // cfg.discover is checked per packet, so the toggle is live
 }
 
 void loop(){
@@ -467,7 +502,7 @@ void loop(){
   if(telnet.hasClient()){
     bool placed=false;
     for(int i=0;i<4;i++) if(!tclients[i]||!tclients[i].connected()){
-      tclients[i]=telnet.available(); tbuf[i]=""; tstate[i]=T_NORMAL;
+      tclients[i]=telnet.available(); tbuf[i]=""; tstate[i]=T_NORMAL; tcr[i]=false;
       tclients[i].println("[connected]"); placed=true; break; }
     if(!placed) telnet.available().stop();
   }
@@ -485,9 +520,15 @@ void loop(){
         case T_SB:   if(b==0xFF) tstate[i]=T_SB_IAC; break;// skip subneg payload until IAC SE
         case T_SB_IAC: tstate[i]=(b==240)?T_NORMAL:T_SB; break; // IAC SE ends it; IAC IAC stays in SB
         default:                                           // T_NORMAL
-          if(b==0xFF)                       tstate[i]=T_IAC;
-          else if(b=='\n'){ handleInput(tbuf[i]); tbuf[i]=""; }
-          else if(b!='\r' && tbuf[i].length()<512) tbuf[i]+=(char)b;
+          // Enter arrives as CR LF, CR NUL (RFC 854), bare CR (xterm, BaudHoundTerm) or bare LF (nc).
+          // Any of them ends the line; the LF or NUL after a CR is the same keypress, not a second one.
+          if(b==0xFF){ tstate[i]=T_IAC; break; }
+          if((b=='\n'||b==0) && tcr[i]){ tcr[i]=false; break; }
+          tcr[i]=(b=='\r');
+          if(b=='\r'||b=='\n'){ handleInput(tbuf[i]); tbuf[i]=""; }
+          else if(b==0) {}                                  // stray NUL: not text
+          else if(b==8||b==127){ if(tbuf[i].length()) tbuf[i].remove(tbuf[i].length()-1); }  // BS / DEL edit the line
+          else if(tbuf[i].length()<512) tbuf[i]+=(char)b;
       }
     }
   }
