@@ -5,7 +5,10 @@
  * page joins your WiFi and configures the COM port. RGB LEDs show net + link status.
  *
  *   Console : http://192.168.4.1/ (on the AP); on your LAN use the IP shown in Settings
- *   Telnet  : telnet <ip> 23
+ *   Telnet  : telnet <ip> 23        (plain; paused while a TLS session is open)
+ *   TLS     : telnet inside TLS on port 992, self-signed certificate made on first boot.
+ *             One TLS session at a time, and while it is open nothing else sees or types:
+ *             plain telnet clients are dropped and refused, the web console is paused.
  *   Find it : UDP broadcast "BAUDHOUND?" to port 47023; each device answers with a JSON line
  *
  * Board  : "ESP32S3 Dev Module"  (USB CDC On Boot: Enabled, for the debug Serial)
@@ -29,6 +32,15 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncUDP.h>
 #include "driver/gpio.h"
+#include <lwip/sockets.h>
+#include "mbedtls/ssl.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/ecp.h"
+#include "mbedtls/x509_crt.h"
+#include "mbedtls/sha256.h"
+#include "mbedtls/base64.h"
 
 // ---------------- fixed defaults ----------------
 #define FW_VERSION "1.4"
@@ -38,6 +50,7 @@
 #define PROBE_LED  39                       // RGB green  = probing / scanning
 #define LOCK_LED   40                       // RGB blue   = receiving / locked
 #define DISCOVERY_PORT 47023                // UDP: answers "BAUDHOUND?" so a desktop app can find it
+#define TLS_PORT   992                      // telnets: the telnet stream inside TLS
 // ------------------------------------------------
 
 struct Cfg {
@@ -62,12 +75,17 @@ DNSServer        dns;
 AsyncUDP         discovery;
 
 HardwareSerial*  com = &Serial1;
-WiFiClient tclients[4];
-String     tbuf[4];
-// telnet input IAC parser state, per client (handles IAC IAC literal, WILL/WONT/DO/DONT, and SB..SE subneg)
+// One telnet input stream (a plain client or the TLS session): IAC parser state plus the line
+// being typed. Handles IAC IAC literal, WILL/WONT/DO/DONT, and SB..SE subnegotiation.
 enum { T_NORMAL=0, T_IAC, T_OPT, T_SB, T_SB_IAC };
-uint8_t    tstate[4] = {0};
-bool       tcr[4] = {false};   // last data byte was CR: a following LF or NUL belongs to the same Enter
+struct LineIn {
+  String  buf;
+  uint8_t state=T_NORMAL;
+  bool    cr=false;            // last data byte was CR: a following LF or NUL belongs to the same Enter
+  void reset(){ buf=""; state=T_NORMAL; cr=false; }
+};
+WiFiClient tclients[4];
+LineIn     tin[4];
 
 volatile bool scanning = false, applyWifi = false, applySerial = false;
 uint32_t lastRxMs = 0, lastTxMs = 0;
@@ -80,6 +98,23 @@ String   webCmd; volatile bool webCmdReady = false;    // web command deferred t
 int      repollFails = 0;                              // consecutive failed auto re-detects
 char     apName[32] = "BaudHound";
 String   lineBuf;
+volatile bool locked=false;                            // a TLS session is open: it alone sees and types
+mbedtls_entropy_context  tlsEntropy;
+mbedtls_ctr_drbg_context tlsDrbg;
+mbedtls_pk_context       tlsKey;
+mbedtls_x509_crt         tlsCrt;
+mbedtls_ssl_config       tlsConf;
+bool     tlsOk=false;                                  // key, cert and config are ready
+int      tlsListen=-1;
+char     tlsFp[64]="";                                 // "SHA256:<base64>" of the certificate, as OpenSSH prints keys
+struct TlsSession {
+  int      fd=-1;
+  bool     ready=false;                                // handshake done
+  uint32_t start=0;
+  char     peer[16]="";
+  mbedtls_ssl_context ssl;
+  LineIn   in;
+} tls;
 
 const uint32_t BAUD_LIST[] = {9600,14400,19200,28800,38400,57600,74880,115200,230400,460800,921600};
 const int      BAUD_N = sizeof(BAUD_LIST)/sizeof(BAUD_LIST[0]);
@@ -135,9 +170,11 @@ void telnetSend(WiFiClient& c, const String& s){     // escape 0xFF (IAC) so a t
   for(size_t i=0;i<s.length();i++){ uint8_t b=(uint8_t)s[i];
     c.write(b); if(b==0xFF) c.write((uint8_t)0xFF); }
 }
+void tlsSendLine(const String& line);
 void broadcast(const String& line){                  // status + target lines to all viewers
   // NB: do NOT stamp lastRxMs here — that would light the RX/activity LED on our own
   // bracketed status output. Real wire RX is stamped only in loop()'s read path.
+  if(locked){ tlsSendLine(line); return; }           // TLS session open: nobody else sees the line
   sse.send(line.c_str(),"message");
   for(auto& c:tclients) if(c&&c.connected()){ telnetSend(c,line); c.print("\r\n"); }
 }
@@ -229,7 +266,9 @@ void handleInput(String line){
   if(t=="~version"||t=="~info"){
     broadcast(String("[BaudHound v")+FW_VERSION+"  uart"+cfg.uart+" rx"+cfg.rx+" tx"+cfg.tx
       +" baud="+(cfg.baud?String(cfg.baud):String("auto"))+" probe="+(cfg.probe?"on":"off")
-      +" swapped="+(rxtxSwapped?"yes":"no")+" discovery="+(cfg.discover?"on":"off")+"]"); return; }
+      +" swapped="+(rxtxSwapped?"yes":"no")+" discovery="+(cfg.discover?"on":"off")+"]");
+    if(tlsOk) broadcast(String("[TLS :")+TLS_PORT+" "+tlsFp+(locked?String(" - session from ")+tls.peer:String(""))+"]");
+    return; }
   if(t=="~ledtest"){
     broadcast("[ledtest] external RGB 0.7s each: GPIO37(red), GPIO39(green), GPIO40(blue); then onboard R/G/B/W");
     int pins[]={SWAP_LED,PROBE_LED,LOCK_LED};
@@ -238,6 +277,183 @@ void handleInput(String line){
     led(0,0,120); delay(700); led(90,90,90); delay(700); led(0,0,0);
     broadcast("[ledtest] done"); return; }
   toTarget(line);
+}
+
+// Feed one received byte of a telnet stream. Enter arrives as CR LF, CR NUL (RFC 854), bare CR
+// (xterm, BaudHoundTerm) or bare LF (nc); any of them ends the line once.
+void telnetFeed(LineIn& in, uint8_t b){
+  switch(in.state){
+    case T_IAC:                                        // prev byte was IAC (0xFF)
+      if(b==0xFF){ if(in.buf.length()<512) in.buf+=(char)0xFF; in.state=T_NORMAL; } // IAC IAC = literal 0xFF
+      else if(b==250)            in.state=T_SB;        // SB  -> subnegotiation
+      else if(b>=251 && b<=254)  in.state=T_OPT;       // WILL/WONT/DO/DONT -> one option byte follows
+      else                       in.state=T_NORMAL;    // other 2-byte command
+      return;
+    case T_OPT:    in.state=T_NORMAL; return;          // swallow the option byte
+    case T_SB:     if(b==0xFF) in.state=T_SB_IAC; return; // skip subneg payload until IAC SE
+    case T_SB_IAC: in.state=(b==240)?T_NORMAL:T_SB; return; // IAC SE ends it; IAC IAC stays in SB
+  }
+  if(b==0xFF){ in.state=T_IAC; return; }
+  if((b=='\n'||b==0) && in.cr){ in.cr=false; return; }
+  in.cr=(b=='\r');
+  if(b=='\r'||b=='\n'){ String line=in.buf; in.buf=""; handleInput(line); }
+  else if(b==0) {}                                     // stray NUL: not text
+  else if(b==8||b==127){ if(in.buf.length()) in.buf.remove(in.buf.length()-1); }  // BS / DEL edit the line
+  else if(in.buf.length()<512) in.buf+=(char)b;
+}
+
+// ---------- TLS console ----------
+// mbedTLS over a raw non-blocking lwIP socket. The key and self-signed certificate are made once
+// and kept in NVS, so the fingerprint a client pinned stays valid across reboots.
+int tlsBioSend(void* ctx,const unsigned char* b,size_t n){
+  int r=send(*(int*)ctx,b,n,MSG_NOSIGNAL);
+  if(r<0) return (errno==EAGAIN||errno==EWOULDBLOCK)?MBEDTLS_ERR_SSL_WANT_WRITE:MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+  return r;
+}
+int tlsBioRecv(void* ctx,unsigned char* b,size_t n){
+  int r=recv(*(int*)ctx,b,n,0);
+  if(r<0) return (errno==EAGAIN||errno==EWOULDBLOCK)?MBEDTLS_ERR_SSL_WANT_READ:MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+  return r;                                            // 0 = peer closed
+}
+
+bool tlsMakeCert(){                                    // first boot: P-256 key + self-signed cert into NVS
+  Serial.println("TLS: generating key and certificate...");
+  if(mbedtls_pk_setup(&tlsKey,mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY))) return false;
+  if(mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1,mbedtls_pk_ec(tlsKey),mbedtls_ctr_drbg_random,&tlsDrbg)) return false;
+  static uint8_t buf[1024];
+  int kl=mbedtls_pk_write_key_der(&tlsKey,buf,sizeof(buf));   // DER is written at the END of buf
+  if(kl<=0) return false;
+  prefs.begin("tls",false); prefs.putBytes("key",buf+sizeof(buf)-kl,kl); prefs.end();
+
+  mbedtls_x509write_cert c; mbedtls_x509write_crt_init(&c);
+  char dn[64]; snprintf(dn,sizeof(dn),"CN=%s,O=BaudHound",apName);
+  uint8_t serial[8]; mbedtls_ctr_drbg_random(&tlsDrbg,serial,sizeof(serial)); serial[0]=(serial[0]&0x7F)|0x01;
+  mbedtls_x509write_crt_set_version(&c,MBEDTLS_X509_CRT_VERSION_3);
+  mbedtls_x509write_crt_set_md_alg(&c,MBEDTLS_MD_SHA256);
+  mbedtls_x509write_crt_set_subject_key(&c,&tlsKey);
+  mbedtls_x509write_crt_set_issuer_key(&c,&tlsKey);
+  int bad=mbedtls_x509write_crt_set_subject_name(&c,dn)
+        | mbedtls_x509write_crt_set_issuer_name(&c,dn)
+        | mbedtls_x509write_crt_set_serial_raw(&c,serial,sizeof(serial))
+        | mbedtls_x509write_crt_set_validity(&c,"20260101000000","20491231235959");
+  int cl=bad?-1:mbedtls_x509write_crt_der(&c,buf,sizeof(buf),mbedtls_ctr_drbg_random,&tlsDrbg);
+  mbedtls_x509write_crt_free(&c);
+  if(cl<=0) return false;
+  prefs.begin("tls",false); prefs.putBytes("crt",buf+sizeof(buf)-cl,cl); prefs.end();
+  mbedtls_pk_free(&tlsKey); mbedtls_pk_init(&tlsKey);  // reload both from NVS, the same path as every later boot
+  return true;
+}
+
+bool tlsLoad(){
+  static uint8_t buf[1024];
+  prefs.begin("tls",true);
+  size_t kl=prefs.isKey("key")?prefs.getBytes("key",buf,sizeof(buf)):0;
+  prefs.end();
+  if(!kl || mbedtls_pk_parse_key(&tlsKey,buf,kl,NULL,0,mbedtls_ctr_drbg_random,&tlsDrbg)) return false;
+  prefs.begin("tls",true);
+  size_t cl=prefs.isKey("crt")?prefs.getBytes("crt",buf,sizeof(buf)):0;
+  prefs.end();
+  if(!cl || mbedtls_x509_crt_parse_der(&tlsCrt,buf,cl)) return false;
+  uint8_t h[32]; mbedtls_sha256(buf,cl,h,0);
+  size_t n=0; strcpy(tlsFp,"SHA256:");
+  mbedtls_base64_encode((uint8_t*)tlsFp+7,sizeof(tlsFp)-8,&n,h,sizeof(h));
+  tlsFp[7+n]=0; while(n && tlsFp[7+n-1]=='='){ tlsFp[7+n-1]=0; n--; }  // unpadded, as OpenSSH prints it
+  return true;
+}
+
+void tlsBegin(){
+  mbedtls_entropy_init(&tlsEntropy); mbedtls_ctr_drbg_init(&tlsDrbg);
+  mbedtls_pk_init(&tlsKey); mbedtls_x509_crt_init(&tlsCrt); mbedtls_ssl_config_init(&tlsConf);
+  if(mbedtls_ctr_drbg_seed(&tlsDrbg,mbedtls_entropy_func,&tlsEntropy,(const uint8_t*)apName,strlen(apName))) return;
+  if(!tlsLoad()){
+    mbedtls_pk_free(&tlsKey); mbedtls_pk_init(&tlsKey); mbedtls_x509_crt_free(&tlsCrt); mbedtls_x509_crt_init(&tlsCrt);
+    if(!tlsMakeCert() || !tlsLoad()){ Serial.println("TLS: no certificate, TLS console disabled"); return; }
+  }
+  if(mbedtls_ssl_config_defaults(&tlsConf,MBEDTLS_SSL_IS_SERVER,MBEDTLS_SSL_TRANSPORT_STREAM,MBEDTLS_SSL_PRESET_DEFAULT)) return;
+  mbedtls_ssl_conf_rng(&tlsConf,mbedtls_ctr_drbg_random,&tlsDrbg);
+  mbedtls_ssl_conf_min_tls_version(&tlsConf,MBEDTLS_SSL_VERSION_TLS1_2);
+  if(mbedtls_ssl_conf_own_cert(&tlsConf,&tlsCrt,&tlsKey)) return;
+
+  tlsListen=socket(AF_INET,SOCK_STREAM,IPPROTO_IP);
+  if(tlsListen<0) return;
+  int one=1; setsockopt(tlsListen,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));
+  sockaddr_in a={}; a.sin_family=AF_INET; a.sin_port=htons(TLS_PORT); a.sin_addr.s_addr=htonl(INADDR_ANY);
+  if(bind(tlsListen,(sockaddr*)&a,sizeof(a))<0 || listen(tlsListen,2)<0){ close(tlsListen); tlsListen=-1; return; }
+  fcntl(tlsListen,F_SETFL,fcntl(tlsListen,F_GETFL,0)|O_NONBLOCK);
+  tlsOk=true;
+  Serial.printf("TLS console :%d  %s\n",TLS_PORT,tlsFp);
+}
+
+void lockOn(){                                         // TLS session is up: it becomes the only viewer
+  String msg=String("[locked: TLS session from ")+tls.peer+" - web console paused]";
+  sse.send(msg.c_str(),"message");
+  for(auto& c:tclients) if(c&&c.connected()){ c.print("[closed: a TLS session started]\r\n"); c.stop(); }
+  locked=true;
+  broadcast(String("[TLS session open - ")+apName+" v" FW_VERSION ", plain telnet and web console are paused]");
+}
+
+void tlsDrop(){
+  if(tls.fd<0) return;
+  bool was=tls.ready;
+  mbedtls_ssl_close_notify(&tls.ssl);                  // best effort; the socket is closed regardless
+  mbedtls_ssl_free(&tls.ssl);
+  close(tls.fd); tls.fd=-1; tls.ready=false; tls.in.reset();
+  if(was){ locked=false; broadcast("[TLS session ended - web console live]"); }
+}
+
+void tlsWrite(const uint8_t* p,size_t n){
+  if(tls.fd<0 || !tls.ready) return;
+  uint32_t t0=millis();
+  while(n){
+    int r=mbedtls_ssl_write(&tls.ssl,p,n);
+    if(r>0){ p+=r; n-=r; continue; }
+    if((r==MBEDTLS_ERR_SSL_WANT_WRITE||r==MBEDTLS_ERR_SSL_WANT_READ) && millis()-t0<2000){ delay(1); continue; }
+    tlsDrop(); return;                                 // stalled 2 s or failed: the client is gone
+  }
+}
+
+void tlsSendLine(const String& line){                  // same framing as plain telnet: IAC escaped, CR LF
+  if(tls.fd<0 || !tls.ready) return;
+  static uint8_t out[1040]; size_t n=0;
+  for(size_t i=0;i<line.length() && n<sizeof(out)-4;i++){ uint8_t b=(uint8_t)line[i];
+    out[n++]=b; if(b==0xFF) out[n++]=0xFF; }
+  out[n++]='\r'; out[n++]='\n';
+  tlsWrite(out,n);
+}
+
+void tlsPoll(){
+  if(!tlsOk) return;
+  sockaddr_in peer; socklen_t pl=sizeof(peer);
+  int fd=accept(tlsListen,(sockaddr*)&peer,&pl);
+  if(fd>=0){
+    if(tls.fd>=0){ close(fd); }                        // one TLS session at a time: refused before any handshake
+    else {
+      fcntl(fd,F_SETFL,fcntl(fd,F_GETFL,0)|O_NONBLOCK);
+      // A laptop that leaves Wi-Fi sends no FIN. Keepalive frees the lock ~25 s later instead of never.
+      int on=1,idle=10,intvl=5,cnt=3;
+      setsockopt(fd,SOL_SOCKET,SO_KEEPALIVE,&on,sizeof(on));
+      setsockopt(fd,IPPROTO_TCP,TCP_KEEPIDLE,&idle,sizeof(idle));
+      setsockopt(fd,IPPROTO_TCP,TCP_KEEPINTVL,&intvl,sizeof(intvl));
+      setsockopt(fd,IPPROTO_TCP,TCP_KEEPCNT,&cnt,sizeof(cnt));
+      setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&on,sizeof(on));
+      tls.fd=fd; tls.ready=false; tls.start=millis(); tls.in.reset();
+      inet_ntoa_r(peer.sin_addr,tls.peer,sizeof(tls.peer));
+      mbedtls_ssl_init(&tls.ssl);
+      if(mbedtls_ssl_setup(&tls.ssl,&tlsConf)){ mbedtls_ssl_free(&tls.ssl); close(fd); tls.fd=-1; }
+      else mbedtls_ssl_set_bio(&tls.ssl,&tls.fd,tlsBioSend,tlsBioRecv,NULL);
+    }
+  }
+  if(tls.fd<0) return;
+  if(!tls.ready){                                      // handshake, one step per loop() so nothing else stalls
+    int r=mbedtls_ssl_handshake(&tls.ssl);
+    if(r==0){ tls.ready=true; Serial.printf("TLS session from %s\n",tls.peer); lockOn(); }
+    else if((r!=MBEDTLS_ERR_SSL_WANT_READ && r!=MBEDTLS_ERR_SSL_WANT_WRITE) || millis()-tls.start>15000) tlsDrop();
+    return;
+  }
+  uint8_t b[128];
+  int r=mbedtls_ssl_read(&tls.ssl,b,sizeof(b));       // one record per loop(), like the other inputs' budgets
+  if(r>0){ for(int i=0;i<r && tls.fd>=0;i++) telnetFeed(tls.in,b[i]); }   // a command may end the session
+  else if(r!=MBEDTLS_ERR_SSL_WANT_READ && r!=MBEDTLS_ERR_SSL_WANT_WRITE) tlsDrop();   // 0, close_notify or error
 }
 
 void startJoin(){ WiFi.begin(cfg.ssid,cfg.pass); joining=true; joinStart=lastJoinTry=millis(); }
@@ -278,12 +494,13 @@ const hb=document.getElementById('hints');
  s.onclick=()=>{in_.value=c;in_.focus()};hb.appendChild(s);});
 let hist=[];try{hist=JSON.parse(localStorage.getItem('sc_hist')||'[]')}catch(e){}
 let hi=hist.length;
+function locked(r){if(r.status==423)add("[locked: a TLS session is active - input refused]\n")}
 function send(){const c=in_.value;in_.value='';
  if(c.length){add("> "+c+"\n");hist.push(c);if(hist.length>50)hist.shift();
   try{localStorage.setItem('sc_hist',JSON.stringify(hist))}catch(e){}}
  hi=hist.length;
- fetch('/send?c='+encodeURIComponent(c),{method:'POST'})}
-function setBaud(v){add("> ~baud "+v+"\n");fetch('/send?c='+encodeURIComponent('~baud '+v),{method:'POST'})}
+ fetch('/send?c='+encodeURIComponent(c),{method:'POST'}).then(locked)}
+function setBaud(v){add("> ~baud "+v+"\n");fetch('/send?c='+encodeURIComponent('~baud '+v),{method:'POST'}).then(locked)}
 fetch('/status').then(r=>r.json()).then(s=>{document.getElementById('baudsel').value=(s.baud==0?'auto':String(s.baud))}).catch(e=>{});
 in_.addEventListener('keydown',e=>{
  if(e.key==='Enter'){send();}
@@ -343,7 +560,9 @@ small{color:#888}</style>
 function g(id){return document.getElementById(id)}
 function load(){fetch('/status').then(r=>r.json()).then(s=>{
  g('stat').innerHTML=(s.sta?('Joined <b>'+s.ssid+'</b> &mdash; '+s.ip):'Not joined (AP only)')
-  +'<br><small>AP: '+s.ap+' @ '+s.apip+'</small>';
+  +'<br><small>AP: '+s.ap+' @ '+s.apip+'</small>'
+  +(s.tls?'<br><small>TLS console :'+s.tls+' - '+s.tlsfp+'</small>':'')
+  +(s.locked?'<br><b style="color:#e96">A TLS session is active: changes are refused until it ends.</b>':'');
  g('ssid').value=s.ssid;g('uart').value=s.uart;g('rx').value=s.rx;g('tx').value=s.tx;
  g('baud').value=s.baud;g('dbits').value=s.dbits;g('parity').value=s.parity;g('sbits').value=s.sbits;
  g('probe').value=s.probe;g('discover').value=s.discover;})}
@@ -358,12 +577,13 @@ function pollScan(){fetch('/scan').then(r=>r.json()).then(s=>{
  }).catch(e=>{g('nets').innerHTML='<small>scan failed</small>'})}
 function joinWifi(){fetch('/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
  body:'ssid='+encodeURIComponent(g('ssid').value)+'&pass='+encodeURIComponent(g('pass').value)})
- .then(()=>{alert('Joining '+g('ssid').value+'\u2026 (AP stays up)');setTimeout(load,4000)})}
+ .then(r=>{if(r.status==423){alert('Locked: a TLS session is active');return}
+  alert('Joining '+g('ssid').value+'\u2026 (AP stays up)');setTimeout(load,4000)})}
 function applySerial(){let p=['uart','rx','tx','baud','dbits','parity','sbits','probe','discover']
  .map(k=>k+'='+encodeURIComponent(g(k).value)).join('&');
  fetch('/serial',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p})
- .then(()=>alert('Applied'+(g('baud').value=='0'?' (auto-detecting\u2026)':'')))}
-function swapRxTx(){fetch('/swap',{method:'POST'}).then(()=>{load();alert('Swapped RX/TX')})}
+ .then(r=>alert(r.status==423?'Locked: a TLS session is active':'Applied'+(g('baud').value=='0'?' (auto-detecting\u2026)':'')))}
+function swapRxTx(){fetch('/swap',{method:'POST'}).then(r=>{load();alert(r.status==423?'Locked: a TLS session is active':'Swapped RX/TX')})}
 load();
 </script>)HTML";
 
@@ -379,7 +599,9 @@ void handleStatus(AsyncWebServerRequest* r){
   j+=",\"parity\":\""+String(cfg.parity)+"\",\"sbits\":"+String(cfg.sbits);
   j+=",\"probe\":"+String(cfg.probe?1:0);
   j+=",\"discover\":"+String(cfg.discover?1:0);
-  j+=",\"fw\":\"" FW_VERSION "\",\"rate\":"+String(com->baudRate())+"}";
+  j+=",\"fw\":\"" FW_VERSION "\",\"rate\":"+String(com->baudRate());
+  j+=",\"tls\":"+String(tlsOk?TLS_PORT:0)+",\"tlsfp\":\""+String(tlsFp)+"\"";
+  j+=",\"locked\":"+String(locked?"true":"false")+"}";
   r->send(200,"application/json",j);
 }
 // Non-blocking: never call the synchronous WiFi.scanNetworks() here — this runs on the
@@ -417,7 +639,9 @@ void onDiscovery(AsyncUDPPacket& p){
   j+=",\"lanip\":\""+(sta?WiFi.localIP().toString():String(""))+"\"";
   j+=",\"telnet\":23,\"http\":80";
   j+=",\"baud\":"+String(cfg.baud)+",\"rate\":"+String(com->baudRate());
-  j+=",\"scanning\":"+String(scanning?"true":"false")+"}";
+  j+=",\"scanning\":"+String(scanning?"true":"false");
+  j+=",\"tls\":"+String(tlsOk?TLS_PORT:0)+",\"tlsfp\":\""+String(tlsFp)+"\"";
+  j+=",\"locked\":"+String(locked?"true":"false")+"}";
   p.write((const uint8_t*)j.c_str(),j.length());
 }
 
@@ -438,10 +662,11 @@ void setup(){
   if(cfg.ssid[0]) startJoin();
 
   dns.start(53,"*",WiFi.softAPIP());
+  tlsBegin();                       // first boot generates the key (a second or two)
 
   Serial.printf("\n== BaudHound (Wireless Com Terminal) v%s ==\n",FW_VERSION);
   Serial.printf("AP: %s (open) @ %s\n",apName,WiFi.softAPIP().toString().c_str());
-  Serial.printf("Console: http://%s/   Telnet :23\n",WiFi.softAPIP().toString().c_str());
+  Serial.printf("Console: http://%s/   Telnet :23   TLS :%d\n",WiFi.softAPIP().toString().c_str(),TLS_PORT);
 
   if(cfg.baud==0){ Serial.println("Auto-detecting baud...");
     uint32_t d=autoBaud(cfg.probe);
@@ -453,13 +678,16 @@ void setup(){
   http.on("/status",   HTTP_GET,  handleStatus);
   http.on("/scan",     HTTP_GET,  handleScan);
   http.on("/send",     HTTP_POST, [](AsyncWebServerRequest* r){
+    if(locked){ r->send(423,"text/plain","locked: a TLS session is active"); return; }
     if(r->hasParam("c")){ webCmd=r->getParam("c")->value(); webCmdReady=true; }  // run in loop(), not async task
     r->send(200,"text/plain","ok"); });
   http.on("/wifi",     HTTP_POST, [](AsyncWebServerRequest* r){
+    if(locked){ r->send(423,"text/plain","locked: a TLS session is active"); return; }
     if(r->hasParam("ssid",true)) strlcpy(cfg.ssid,r->getParam("ssid",true)->value().c_str(),sizeof(cfg.ssid));
     if(r->hasParam("pass",true)) strlcpy(cfg.pass,r->getParam("pass",true)->value().c_str(),sizeof(cfg.pass));
     cfgSave(); applyWifi=true; r->send(200,"text/plain","ok"); });
   http.on("/serial",   HTTP_POST, [](AsyncWebServerRequest* r){
+    if(locked){ r->send(423,"text/plain","locked: a TLS session is active"); return; }
     auto P=[&](const char*k,long d)->long{ return r->hasParam(k,true)?r->getParam(k,true)->value().toInt():d; };
     cfg.uart=P("uart",cfg.uart)==0?0:1;
     cfg.rx=P("rx",cfg.rx); cfg.tx=P("tx",cfg.tx);
@@ -471,8 +699,10 @@ void setup(){
     cfg.discover=P("discover",cfg.discover?1:0)!=0;
     cfgSave(); applySerial=true; r->send(200,"text/plain","ok"); });
   http.on("/swap",     HTTP_POST, [](AsyncWebServerRequest* r){
+    if(locked){ r->send(423,"text/plain","locked: a TLS session is active"); return; }
     swapRxTx(); cfgSave(); r->send(200,"text/plain","ok"); });
-  sse.onConnect([](AsyncEventSourceClient* c){ c->send("[web client connected]"); });
+  sse.onConnect([](AsyncEventSourceClient* c){
+    c->send(locked?"[locked: a TLS session is active - web console paused]":"[web client connected]"); });
   http.addHandler(&sse);
   http.onNotFound([](AsyncWebServerRequest* r){        // captive portal -> bounce to console at the IP (no DNS needed)
     r->send(200,"text/html",
@@ -500,38 +730,20 @@ void loop(){
   }
 
   if(telnet.hasClient()){
-    bool placed=false;
-    for(int i=0;i<4;i++) if(!tclients[i]||!tclients[i].connected()){
-      tclients[i]=telnet.available(); tbuf[i]=""; tstate[i]=T_NORMAL; tcr[i]=false;
-      tclients[i].println("[connected]"); placed=true; break; }
-    if(!placed) telnet.available().stop();
+    if(locked){ WiFiClient c=telnet.accept(); c.print("[locked: a TLS session is active]\r\n"); c.stop(); }
+    else {
+      bool placed=false;
+      for(int i=0;i<4;i++) if(!tclients[i]||!tclients[i].connected()){
+        tclients[i]=telnet.accept(); tin[i].reset();
+        tclients[i].println("[connected]"); placed=true; break; }
+      if(!placed) telnet.accept().stop();
+    }
   }
   for(int i=0;i<4;i++){ WiFiClient& c=tclients[i];
     if(!c||!c.connected()) continue;
-    while(c.available()){ uint8_t b=c.read();
-      switch(tstate[i]){
-        case T_IAC:                                        // prev byte was IAC (0xFF)
-          if(b==0xFF){ if(tbuf[i].length()<512) tbuf[i]+=(char)0xFF; tstate[i]=T_NORMAL; } // IAC IAC = literal 0xFF
-          else if(b==250)            tstate[i]=T_SB;       // SB  -> subnegotiation
-          else if(b>=251 && b<=254)  tstate[i]=T_OPT;      // WILL/WONT/DO/DONT -> one option byte follows
-          else                       tstate[i]=T_NORMAL;   // other 2-byte command
-          break;
-        case T_OPT:  tstate[i]=T_NORMAL; break;            // swallow the option byte
-        case T_SB:   if(b==0xFF) tstate[i]=T_SB_IAC; break;// skip subneg payload until IAC SE
-        case T_SB_IAC: tstate[i]=(b==240)?T_NORMAL:T_SB; break; // IAC SE ends it; IAC IAC stays in SB
-        default:                                           // T_NORMAL
-          // Enter arrives as CR LF, CR NUL (RFC 854), bare CR (xterm, BaudHoundTerm) or bare LF (nc).
-          // Any of them ends the line; the LF or NUL after a CR is the same keypress, not a second one.
-          if(b==0xFF){ tstate[i]=T_IAC; break; }
-          if((b=='\n'||b==0) && tcr[i]){ tcr[i]=false; break; }
-          tcr[i]=(b=='\r');
-          if(b=='\r'||b=='\n'){ handleInput(tbuf[i]); tbuf[i]=""; }
-          else if(b==0) {}                                  // stray NUL: not text
-          else if(b==8||b==127){ if(tbuf[i].length()) tbuf[i].remove(tbuf[i].length()-1); }  // BS / DEL edit the line
-          else if(tbuf[i].length()<512) tbuf[i]+=(char)b;
-      }
-    }
+    while(c.available() && !locked) telnetFeed(tin[i],c.read());
   }
+  tlsPoll();
   // USB terminal (native USB CDC) <-> target : raw transparent passthrough
   if(Serial){ while(Serial.available()){ com->write((uint8_t)Serial.read()); lastTxMs=millis(); } }
 

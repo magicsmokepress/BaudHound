@@ -21,6 +21,7 @@ Built for bench work: probe a device's TTL serial port, and BaudHound hunts for 
 - **Three ways in, simultaneously**
   - **Web UI** — open a page, watch live output, type commands, change baud from a dropdown.
   - **Telnet** (port 23) — connect with PuTTY / `nc` / any telnet client (up to 4 at once).
+  - **TLS** (port 992) - the same console encrypted, one client at a time. While it is open nobody else can watch or type (firmware 1.4+).
   - **USB serial** — the board shows up as a COM port; raw, character-by-character passthrough (great for interactive menus).
 - **Automatic baud detection** — multi-pass scan across standard rates (9600 → 921600, incl. 14400/28800/74880). Locks on to whatever the target is emitting.
 - **Active "wake" probe** — optionally sends an Enter to nudge a silent console into responding, then detects.
@@ -133,8 +134,19 @@ Plug BaudHound into your PC — it enumerates as a **COM port**.
 - This path is **raw / per-character**, so interactive menus, arrow keys, and prompts-without-newlines all work.
 - The **actual target baud** is whatever BaudHound is set to (Auto or fixed) — set it in the web UI, not in PuTTY.
 
-### 4. BaudHoundTerm (Windows)
-[BaudHoundTerm](https://github.com/magicsmokepress/baudhoundterm) is the desktop console for BaudHound. Its **BaudHound** button lists the devices on the networks the PC is on and opens one in a telnet tab set up for it: local echo and line editing, these `~` commands on the right-click menu, logging, and reconnect. It can also save the device as a shortcut; saving it again after its DHCP address changes moves the shortcut to the new address.
+### 4. TLS (port 992)
+Plain telnet and the web console send everything in the clear, so anyone on the network can read it. Port 992 carries the same telnet stream inside TLS 1.2.
+
+- The certificate is self-signed (ECDSA P-256), made on the first boot of 1.4 and kept across reboots. Its fingerprint is on the **⚙ Settings** page and in `~info`, as `SHA256:...`. BaudHoundTerm asks you to trust it on first connect and warns if it ever changes.
+- **One TLS session, and it is exclusive.** When it opens, plain telnet clients are disconnected and new ones refused, the web console stops showing output, and the web page refuses input and settings changes. A second TLS client is refused. Everything resumes when the session ends.
+- A client that drops off the network without closing frees the device about 25 seconds later (TCP keepalive). A connection that never completes the handshake is dropped after 15 seconds.
+- USB is not paused: it needs the device in hand.
+- There is no password. Anyone on the network can still open the TLS session first, but then they hold it alone and nobody can listen in.
+
+Other clients: `openssl s_client -quiet -connect <ip>:992`.
+
+### 5. BaudHoundTerm (Windows)
+[BaudHoundTerm](https://github.com/magicsmokepress/baudhoundterm) is the desktop console for BaudHound. Its **BaudHound** button lists the devices on the networks the PC is on and opens one, over TLS when the device has it, in a tab set up for it: local echo and line editing, these `~` commands on the right-click menu, logging, and reconnect. It can also save the device as a shortcut; saving it again after its DHCP address changes moves the shortcut to the new address.
 
 ---
 
@@ -145,10 +157,11 @@ Firmware 1.4 and later listen on **UDP 47023**. A datagram starting with `BAUDHO
 ```json
 {"baudhound":1,"name":"BaudHound-41D0","fw":"1.4","ip":"192.168.1.50","apip":"192.168.4.1",
  "sta":true,"ssid":"bench","lanip":"192.168.1.50","telnet":23,"http":80,
- "baud":0,"rate":115200,"scanning":false}
+ "baud":0,"rate":115200,"scanning":false,
+ "tls":992,"tlsfp":"SHA256:i53p547UBDcVHZFugau3n9X6ThfqnefwLnDUkfkT+XY","locked":false}
 ```
 
-`ip` is the address the query arrived on, `baud` is the configured speed (0 = auto) and `rate` the speed in use now. It answers on its own AP and on the joined network, also while a baud scan is running, and at most 8 replies a second. Try it from a Linux shell:
+`ip` is the address the query arrived on, `baud` is the configured speed (0 = auto) and `rate` the speed in use now. `locked` is true while a TLS session is open. It answers on its own AP and on the joined network, also while a baud scan is running, and at most 8 replies a second. Try it from a Linux shell:
 
 ```bash
 python3 -c "import socket as s;u=s.socket(2,2);u.setsockopt(1,6,1);u.settimeout(2);u.sendto(b'BAUDHOUND?',('255.255.255.255',47023));print(u.recvfrom(512))"
@@ -170,7 +183,7 @@ Type these in the **web** or **telnet** console (not the USB passthrough — the
 | `~probe` | Toggle **active wake-probe** (sends Enter during detection) |
 | `~probe on` / `~probe off` | Force wake-probe on/off |
 | `~swap` | Swap RX/TX pin assignment (for a reversed cable) |
-| `~version` / `~info` | Show firmware version, current link settings and whether discovery is on |
+| `~version` / `~info` | Show firmware version, link settings, discovery state and the TLS fingerprint |
 | `~ledtest` | Cycle the status LEDs to verify wiring/colors |
 
 Anything **without** a leading `~` is sent to the target device as-is.
@@ -253,7 +266,7 @@ Modern browsers use DNS-over-HTTPS, which bypasses the device's captive DNS — 
 
 ## Security note
 
-The AP ships **open** (no password) for convenience. Discovery (UDP 47023) tells anyone on the same network that a BaudHound is there and which network it joined; switch it off in Settings when that matters. Anyone in range can reach the console — and therefore read/write whatever target UART is attached. Fine for a bench; add a password (`AP_PASS` + `WiFi.softAP(apName, AP_PASS)`) before leaving it connected to anything sensitive, or DO NOT USE IT. Intent for this is quick and dirty, temporary connectivity to an IOT TTL serial port. Do not use it for where integrity, security and confidentiality are required. 
+The AP ships **open** (no password) for convenience. Plain telnet (23) and the web console are unencrypted; use the TLS console (992) on any network you share. Discovery (UDP 47023) tells anyone on the same network that a BaudHound is there and which network it joined; switch it off in Settings when that matters. Anyone in range can reach the console — and therefore read/write whatever target UART is attached. Fine for a bench; add a password (`AP_PASS` + `WiFi.softAP(apName, AP_PASS)`) before leaving it connected to anything sensitive, or DO NOT USE IT. Intent for this is quick and dirty, temporary connectivity to an IOT TTL serial port. Do not use it for where integrity, security and confidentiality are required. 
 
 ---
 
