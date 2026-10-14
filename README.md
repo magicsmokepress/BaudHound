@@ -145,6 +145,8 @@ Plain telnet and the web console send everything in the clear, so anyone on the 
 
 Other clients: `openssl s_client -quiet -connect <ip>:992`.
 
+Details, fingerprint checks and how to replace the certificate: [docs/TLS.md](docs/TLS.md).
+
 ### 5. BaudHoundTerm (Windows)
 [BaudHoundTerm](https://github.com/magicsmokepress/baudhoundterm) is the desktop console for BaudHound. Its **BaudHound** button lists the devices on the networks the PC is on and opens one, over TLS when the device has it, in a tab set up for it: local echo and line editing, these `~` commands on the right-click menu, logging, and reconnect. It can also save the device as a shortcut; saving it again after its DHCP address changes moves the shortcut to the new address.
 
