@@ -1,5 +1,8 @@
 # 🐾 BaudHound — Wireless Com Terminal
 
+> **This repository has moved to [github.com/info-mah7/BaudHound](https://github.com/info-mah7/BaudHound).**
+> This copy is archived and no longer updated. Code, releases and issues live there.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Topics:** `esp32` · `esp32-s3` · `arduino` · `serial-console` · `uart` · `baud-rate-detection` · `telnet` · `wifi` · `embedded`
